@@ -9,12 +9,13 @@
 #include "pipe.h"
 #include "shell.h"
 #include "mips.h"
+#include "cache.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 
-//#define DEBUG
+// #define DEBUG
 
 /* debug */
 void print_op(Pipe_Op *op)
@@ -29,11 +30,14 @@ void print_op(Pipe_Op *op)
 
 /* global pipeline state */
 Pipe_State pipe;
+Cache icache, dcache;
 
 void pipe_init()
 {
     memset(&pipe, 0, sizeof(Pipe_State));
     pipe.PC = 0x00400000;
+    cache_init(&icache, ICACHE_SIZE, CACHE_BLOCK_SIZE, ICACHE_ASSOCIATIVITY, CACHE_REPLACE_LRU);
+    cache_init(&dcache, DCACHE_SIZE, CACHE_BLOCK_SIZE, DCACHE_ASSOCIATIVITY, CACHE_REPLACE_LRU);
 }
 
 void pipe_cycle()
@@ -87,6 +91,11 @@ void pipe_cycle()
 
         stat_squash++;
     }
+
+    if(RUN_BIT == FALSE) {
+        cache_free(&icache);
+        cache_free(&dcache);
+    }
 }
 
 void pipe_recover(int flush, uint32_t dest)
@@ -123,7 +132,7 @@ void pipe_stage_wb()
     /* if this was a syscall, perform action */
     if (op->opcode == OP_SPECIAL && op->subop == SUBOP_SYSCALL) {
         if (op->reg_src1_value == 0xA) {
-            pipe.PC = op->pc; /* fetch will do pc += 4, then we stop with correct PC */
+            pipe.PC = op->pc + 4; /* fetch will do pc += 4, then we stop with correct PC */
             RUN_BIT = 0;
         }
     }
@@ -144,8 +153,10 @@ void pipe_stage_mem()
     Pipe_Op *op = pipe.mem_op;
 
     uint32_t val = 0;
-    if (op->is_mem)
-        val = mem_read_32(op->mem_addr & ~3);
+    if (op->is_mem) {
+        if(cache_access(&dcache, op->mem_addr & ~3, &val, false) != CACHE_HIT)
+            return;
+    }
 
     switch (op->opcode) {
         case OP_LW:
@@ -202,7 +213,8 @@ void pipe_stage_mem()
                 case 3: val = (val & 0x00FFFFFF) | ((op->mem_value & 0xFF) << 24); break;
             }
 
-            mem_write_32(op->mem_addr & ~3, val);
+            if(cache_access(&dcache, op->mem_addr & ~3, &val, true) != CACHE_HIT)
+                return;
             break;
 
         case OP_SH:
@@ -217,12 +229,14 @@ void pipe_stage_mem()
             printf("new word %08x\n", val);
 #endif
 
-            mem_write_32(op->mem_addr & ~3, val);
+            if(cache_access(&dcache, op->mem_addr & ~3, &val, true) != CACHE_HIT)
+                return;
             break;
 
         case OP_SW:
             val = op->mem_value;
-            mem_write_32(op->mem_addr & ~3, val);
+            if(cache_access(&dcache, op->mem_addr & ~3, &val, true) != CACHE_HIT)
+                return;
             break;
     }
 
@@ -666,21 +680,29 @@ void pipe_stage_decode()
 
 void pipe_stage_fetch()
 {
+    static Pipe_Op *op = NULL;
     /* if pipeline is stalled (our output slot is not empty), return */
     if (pipe.decode_op != NULL)
         return;
 
     /* Allocate an op and send it down the pipeline. */
-    Pipe_Op *op = malloc(sizeof(Pipe_Op));
-    memset(op, 0, sizeof(Pipe_Op));
-    op->reg_src1 = op->reg_src2 = op->reg_dst = -1;
-
-    op->instruction = mem_read_32(pipe.PC);
+    if(op == NULL) {
+        op = (Pipe_Op *)calloc(1, sizeof(Pipe_Op));
+        if(op == NULL) {
+            printf("Out of memory in fetch stage.\r\n");
+            exit(-1);
+        }
+        op->reg_src1 = op->reg_src2 = op->reg_dst = -1;
+    }
+    if(cache_access(&icache, pipe.PC, &op->instruction, false) != CACHE_HIT)
+        return;
     op->pc = pipe.PC;
     pipe.decode_op = op;
+    op = NULL;
 
     /* update PC */
-    pipe.PC += 4;
+    if(RUN_BIT == TRUE)
+        pipe.PC += 4;
 
     stat_inst_fetch++;
 }
