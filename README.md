@@ -1,2 +1,2 @@
-# ETH-Computer-Architecture
+# Computer Architecture
 Archive of ETH Computer Architecture labs.
